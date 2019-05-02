@@ -1,242 +1,350 @@
+#include <stdbool.h>
+#include <libgen.h>
 #include <stdio.h>
-#include <signal.h>
+#include <sys/stat.h>
+#include <memory.h>
+#include <dirent.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <sys/wait.h>
-#include <libgen.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <semaphore.h>
+#include <errno.h>
+#include <ctype.h>
+#include <time.h>
 #include <sys/time.h>
+#include <stdlib.h>
 
-#define PROCESSES_COUNT 9
-#define PARENTS_COUNT 5
+#define ARGUMENTS_AMOUNT 2
+#define LEN_PATH 256
 
-char *MODULE_NAME;
-int *PROCESSES_PIDS;
+char *module_name;
+FILE *out;
+static pid_t group_id, parent, base_group, second_proc;
+static int received = 0;
 
-typedef struct {
-    int process_number;
-    int children_count;
-    int *children;
-} forking_info_t;
-
-int PROCESS_NUMBER = 0;
-int sig_received = 0;
-int sig_usr1_sent = 0;
-int sig_usr2_sent = 0;
-
-int RECEIVERS_IDS[PROCESSES_COUNT] = {-1, 2, -1, -1, -1, 6, -1, -1, 1};
-int SIGNALS_TO_SEND[PROCESSES_COUNT] = {-1, SIGUSR1, -1, -1, -1, SIGUSR1, -1, -1, SIGUSR1};
-int GROUPS_INFO[PROCESSES_COUNT] = {0, 1, 2, 2, 2, 2, 6, 6, 6};
-
-forking_info_t *FORKING_SCHEME;
-
-void printError(const char *module_name, const char *error_msg, const char *function_name) {
-    fprintf(stderr, "%s: %s: %s\n", module_name, function_name ? function_name : "", error_msg);
+void printError(const char *module_name, const char *error_msg, const char *file_name) {
+    fprintf(stderr, "%s: %s %s\n", module_name, error_msg, file_name ? file_name : "");
 }
 
-long long currentTime() {
+
+void putFile(const char *num) {
+    char *name = (char *)malloc(sizeof(char) * LEN_PATH);
+    if (name) {
+        strcpy(name, "/tmp/LAB4/");
+        strcat(name, num);
+        strcat(name, ".pid\0");
+        FILE *f = fopen(name, "w+");
+        if (f) {
+            //fprintf(f, "%d", getpid());
+            fclose(f);
+        } else {
+            printError(module_name, "File can not be open.", name);
+        }
+        free(name);
+    } else {
+        printError(module_name, "Memory allocation error.", NULL);
+    }
+}
+
+bool isForkingDone() {
+    int count = 0;
+    DIR *dir;
+    if ((dir = opendir("/tmp/LAB4"))) {
+        struct dirent *direntbuf;
+        while ((direntbuf = readdir(dir))) {
+            count += direntbuf->d_type == DT_REG && !strcmp(direntbuf->d_name + 1, ".pid");
+        }
+        closedir(dir);
+    }
+    return count == 8;
+}
+
+long long getTime() {
     struct timeval time;
     gettimeofday(&time, NULL);
-    return time.tv_usec / 1000;
+    return time.tv_usec % 1000;
 }
 
-char *signalName(int signum) {
-    switch (signum) {
-        case SIGUSR1:
-            return "USR1";
-        case SIGUSR2:
-            return "USR2";
-        default:
-            return "not found";
-    }
-}
+void process1SIGUSR() {
+    //usleep(880);
+    if (received == 101) {
 
-void printInfo(int process_number, char is_received, int signal_number) {
-    printf("%d %d %d %s %s %lld\n", process_number, getpid(), getppid(), is_received ? "получил" : "послал",
-           signalName(signal_number), currentTime());
-    fflush(stdout);
-}
+        printf("1 %d %d send SIGTERM %lld\n", getpid(), getppid(), getTime());
+        fprintf(out, "1 %d %d send SIGTERM %lld\n", getpid(), getppid(), getTime());
 
-void printStat(int usr1_count, int usr2_count) {
-    printf("%d %d завершил работу после %d-го сигнала SIGUSR1 и %d-го сигнала SIGUSR2\n", getpid(), getppid(), usr1_count,
-           usr2_count);
-}
+        kill(-base_group, SIGTERM);
 
-void createForkingScheme(forking_info_t *forking_scheme) {
+        while (wait(NULL) != -1);
+        //wait for children
+        printf("1 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+        fprintf(out, "1 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
 
-    forking_scheme[0].process_number = 0;
-    forking_scheme[0].children_count = 1;
-    forking_scheme[0].children = malloc(sizeof(int));
-    forking_scheme[0].children[0] = 1;
-
-    forking_scheme[1].process_number = 1;
-    forking_scheme[1].children_count = 4;
-    forking_scheme[1].children = malloc(sizeof(int) * 4);
-    forking_scheme[1].children[0] = 2;
-    forking_scheme[1].children[1] = 3;
-    forking_scheme[1].children[2] = 4;
-    forking_scheme[1].children[3] = 5;
-
-    forking_scheme[2].process_number = 2;
-    forking_scheme[2].children_count = 1;
-    forking_scheme[2].children = malloc(sizeof(int));
-    forking_scheme[2].children[0] = 6;
-
-    forking_scheme[3].process_number = 3;
-    forking_scheme[3].children_count = 1;
-    forking_scheme[3].children = malloc(sizeof(int));
-    forking_scheme[3].children[0] = 7;
-
-    forking_scheme[4].process_number = 4;
-    forking_scheme[4].children_count = 1;
-    forking_scheme[4].children = malloc(sizeof(int));
-    forking_scheme[4].children[0] = 8;
-}
-
-
-forking_info_t *getForkInfo(int process_number, forking_info_t *forking_scheme) {
-    for (int i = 0; i < PARENTS_COUNT; i++) {
-        if (forking_scheme[i].process_number == process_number) {
-            return &(forking_scheme[i]);
-        }
-    }
-    return NULL;
-}
-
-void signalHandler(int signum) {
-    if (signum != SIGTERM) {
-        printInfo(PROCESS_NUMBER, 1, signum);
-        int receiver_number = RECEIVERS_IDS[PROCESS_NUMBER];
-        sig_received++;
-        if (PROCESS_NUMBER == 1) {
-            if (sig_received == 101) {
-                if (kill(-PROCESSES_PIDS[RECEIVERS_IDS[PROCESS_NUMBER]], SIGTERM) == -1) {
-                    printError(MODULE_NAME, strerror(errno), "kill");
-                    exit(0);
-                };
-                while (wait(NULL) > 0);
-                exit(0);
-            }
-        }
-        if (receiver_number != -1) {
-            int signal_to_send = SIGNALS_TO_SEND[PROCESS_NUMBER];
-            usleep(100);
-            if (kill(-PROCESSES_PIDS[RECEIVERS_IDS[PROCESS_NUMBER]], signal_to_send) == -1) {
-                printError(MODULE_NAME, strerror(errno), "kill");
-                exit(1);
-            } else {
-                printInfo(PROCESS_NUMBER, 0, signal_to_send);
-                (signal_to_send == SIGUSR1) ? sig_usr1_sent++ : sig_usr2_sent++;
-            };
-        }
-    } else {
-        if (kill(-PROCESSES_PIDS[RECEIVERS_IDS[PROCESS_NUMBER]], SIGTERM) == -1) {
-            printError(MODULE_NAME, strerror(errno), "kill");
-            exit(0);
-        };
-        while (wait(NULL) > 0);
-        if (PROCESS_NUMBER != 1) {
-            printStat(sig_usr1_sent, sig_usr2_sent);
-        }
         exit(0);
+    } else {
+        //sleep(1);
+        printf("1 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+        fprintf(out, "1 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+
+        received++;
+
+        printf("1 %d %d send SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+        fprintf(out, "1 %d %d send SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+
+        kill(-base_group, SIGUSR1);
     }
 }
 
-void clearForkingScheme(forking_info_t *forking_scheme) {
-    for (int i = 0; i < PARENTS_COUNT; i++) {
-        free(forking_scheme[i].children);
-    }
-    free(forking_scheme);
+void process2SIGUSR() {
+    printf("2 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "2 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    received++;
 }
 
-char isAllSet(pid_t *process_pids) {
-    for (int i = 0; i < PROCESSES_COUNT; i++) {
-        if (!process_pids[i]) {
-            return 0;
-        }
-    }
-    return 1;
+void process3SIGUSR() {
+    printf("3 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "3 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    received++;
 }
 
-void startProcess() {
-    PROCESSES_PIDS[0] = getpid();
-    int forked_process_number;
-    int child_number = 0;
-    pid_t group_leader;
-    forking_info_t *forking_info;
+void process4SIGUSR() {
+    printf("4 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "4 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    received++;
+}
 
-    struct sigaction sig_handler;
-    sig_handler.sa_handler = &signalHandler;
-    sig_handler.sa_flags = 0;
-    sigset_t sigset;
-    sigemptyset(&sigset);
+void process5SIGUSR() {
+    printf("5 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "5 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    received++;
+    //usleep(440);
+    printf("5 %d %d send SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "5 %d %d send SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    kill(-group_id, SIGUSR1);
+}
 
-    while ((forking_info = getForkInfo(PROCESS_NUMBER, FORKING_SCHEME)) &&
-           (child_number < forking_info->children_count)) {
-        forked_process_number = forking_info->children[child_number];
-        pid_t child = fork();
-        switch (child) {
-            case 0:
-                child_number = 0;
-                PROCESS_NUMBER = forked_process_number;
-                break;
-            case -1:
-                printError(MODULE_NAME, strerror(errno), "fork");
-                exit(1);
-            default:
-                while (!(group_leader = PROCESSES_PIDS[GROUPS_INFO[forked_process_number]]));
-                if (setpgid(child, group_leader) == -1) {
-                    printError(MODULE_NAME, strerror(errno), "setpgid");
-                    exit(1);
-                };
-                child_number++;
-        }
-    }
-    if (sigaction(SIGUSR1, &sig_handler, 0) == -1) {
-        printError(MODULE_NAME, strerror(errno), "sigaction");
-    };
-    if (sigaction(SIGUSR2, &sig_handler, 0) == -1) {
-        printError(MODULE_NAME, strerror(errno), "sigaction");
-    };
-    if (sigaction(SIGTERM, &sig_handler, 0) == -1) {
-        printError(MODULE_NAME, strerror(errno), "sigaction");
-    };
+void process6SIGUSR() {
+    printf("6 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "6 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    received++;
+}
 
-    PROCESSES_PIDS[PROCESS_NUMBER] = getpid();
-    if (PROCESS_NUMBER == 1) {
-        while (!isAllSet(PROCESSES_PIDS));
-        int signal_to_send = SIGNALS_TO_SEND[PROCESS_NUMBER];
-        kill(-PROCESSES_PIDS[RECEIVERS_IDS[PROCESS_NUMBER]], signal_to_send);
-        printInfo(PROCESS_NUMBER, 0, signal_to_send);
-    }
-    if (PROCESS_NUMBER == 0) {
-        wait(NULL);
+void process7SIGUSR() {
+    printf("7 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "7 %d %d SIGUSR1 got %lld\n", getpid(), getppid(), getTime());
+    received++;
+}
+
+void process8SIGUSR() {
+    printf("8 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "8 %d %d got SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    received++;
+    //usleep(440);
+    printf("8 %d %d send SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    fprintf(out, "8 %d %d send SIGUSR1 %lld\n", getpid(), getppid(), getTime());
+    kill(parent, SIGUSR1);
+}
+
+void process2SIGTERM() {
+    printf("2 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "2 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+void process3SIGTERM() {
+    printf("3 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "3 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+void process4SIGTERM() {
+    printf("4 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "4 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+void process5SIGTERM() {
+    printf("5 %d %d %d send SIGTERM\n", getpid(), getppid(), received);
+    fprintf(out, "5 %d %d %d send SIGTERM\n", getpid(), getppid(), received);
+    kill(-group_id, SIGTERM);
+    while (wait(NULL) != -1);
+    //wait for children
+    printf("5 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "5 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+void process6SIGTERM() {
+    printf("6 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "6 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+void process7SIGTERM() {
+    printf("7 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "7 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+void process8SIGTERM() {
+    printf("8 %d %d %d SIGUSR1 end %d\n", getpid(), getppid(), received, getpgid(getpid()));
+    fprintf(out, "8 %d %d %d SIGUSR1 end\n", getpid(), getppid(), received);
+    exit(0);
+}
+
+
+void startProcesses() {
+    parent = fork();
+    if (parent == -1) {
+        printError(module_name, "Unable to create process.", NULL);
         return;
     }
-    while (1){
-        sleep(1);
-    };
+
+    if (parent > 0) {
+        while (wait(NULL) != -1);
+        return;
+    }
+
+    if (!parent) {
+
+        struct sigaction handler;
+        handler.sa_handler = &process1SIGUSR;
+        sigaction(SIGUSR1, &handler, 0);
+        sigfillset(&handler.sa_mask);
+        handler.sa_flags = SA_RESTART;
+
+        parent = getpid();
+        putFile("1");
+
+        pid_t child;
+        child = fork();
+        second_proc = child;
+        if (!child) {
+            //2
+            handler.sa_handler = &process2SIGUSR;
+            sigaction(SIGUSR1, &handler, 0);
+            handler.sa_handler = &process2SIGTERM;
+            sigaction(SIGTERM, &handler, 0);
+            //setpgid(getpid(), getpid());
+            putFile("2");
+            while (1);
+        } else if (child > 0) {
+            setpgid(child, child);
+            group_id = child;
+            base_group = child;
+            child = fork();
+            if (!child) {
+                //3
+                handler.sa_handler = &process3SIGUSR;
+                sigaction(SIGUSR1, &handler, 0);
+                handler.sa_handler = &process3SIGTERM;
+                sigaction(SIGTERM, &handler, 0);
+                //setpgid(getpid(), group_id);
+                putFile("3");
+                while (1);
+            } else if (child > 0) {
+                setpgid(child, group_id);
+                child = fork();
+                if (!child) {
+                    //4
+                    handler.sa_handler = &process4SIGUSR;
+                    sigaction(SIGUSR1, &handler, 0);
+                    handler.sa_handler = &process4SIGTERM;
+                    sigaction(SIGTERM, &handler, 0);
+                    //setpgid(getpid(), group_id);
+                    putFile("4");
+                    while (1);
+                } else if (child > 0) {
+                    setpgid(child, group_id);
+                    child = fork();
+                    if (!child) {
+                        //5
+                        handler.sa_handler = &process5SIGUSR;
+                        sigaction(SIGUSR1, &handler, 0);
+                        handler.sa_handler = &process5SIGTERM;
+                        sigaction(SIGTERM, &handler, 0);
+                        //setpgid(getpid(), group_id);
+                        putFile("5");
+                        child = fork();
+                        if (!child) {
+                            //6
+                            handler.sa_handler = &process6SIGUSR;
+                            sigaction(SIGUSR1, &handler, 0);
+                            handler.sa_handler = &process6SIGTERM;
+                            sigaction(SIGTERM, &handler, 0);
+                            //setpgid(getpid(), getpid());
+                            putFile("6");
+                            while (1);
+                        } else if (child > 0) {
+                            setpgid(child, child);
+                            group_id = child;
+                            child = fork();
+                            if (!child) {
+                                //7
+                                handler.sa_handler = &process7SIGUSR;
+                                sigaction(SIGUSR1, &handler, 0);
+                                handler.sa_handler = &process7SIGTERM;
+                                sigaction(SIGTERM, &handler, 0);
+                                //setpgid(getpid(), group_id);
+                                putFile("7");
+                                while (1);
+                            } else if (child > 0) {
+                                setpgid(child, group_id);
+                                child = fork();
+                                if (!child) {
+                                    //8
+                                    handler.sa_handler = &process8SIGUSR;
+                                    sigaction(SIGUSR1, &handler, 0);
+                                    handler.sa_handler = &process8SIGTERM;
+                                    sigaction(SIGTERM, &handler, 0);
+                                    //setpgid(getpid(), group_id);
+                                    putFile("8");
+                                    while (1);
+                                } else if (child > 0) {
+                                    setpgid(child, group_id);
+                                }
+                            }
+                        }
+                        while (1);
+                    } else
+                        if (child > 0) {
+                            setpgid(child, group_id);
+                    }
+                }
+            }
+        }
+        while (!isForkingDone());
+
+        kill(-base_group, SIGUSR1);
+
+        while (1);
+    }
 }
 
 
 int main(int argc, char *argv[]) {
-    MODULE_NAME = basename(argv[0]);
-    FORKING_SCHEME = malloc(sizeof(forking_info_t) * PARENTS_COUNT);
-
-    createForkingScheme(FORKING_SCHEME);
-    if (!(PROCESSES_PIDS = mmap(NULL, PROCESSES_COUNT * sizeof(pid_t), PROT_READ | PROT_WRITE,
-                                MAP_SHARED | MAP_ANONYMOUS, -1, 0))) {
-        printError(MODULE_NAME, strerror(errno), "mmap");
+    module_name = basename(argv[0]);
+    if (argc < ARGUMENTS_AMOUNT){
+        printError(module_name, "The amount of arguments is not correct.", NULL);
         return 1;
     }
 
-    startProcess();
+    if (!(out = fopen(argv[1], "w+"))) {
+        printError(module_name, "File cannot be open.", argv[1]);
+        return 1;
+    }
 
-    if (munmap(PROCESSES_PIDS, sizeof(pid_t) * PROCESSES_COUNT) == -1) {
-        printError(MODULE_NAME, strerror(errno), "munmap");
-    };
-    clearForkingScheme(FORKING_SCHEME);
+    if (mkdir("/tmp/LAB4", 0777)) {
+        printError(module_name, "Unable to create directory.", "tmp/LAB4");
+        return 1;
+    }
+
+    startProcesses();
+    system("rm -r /tmp/LAB4");
+    fclose(out);
+    //while (wait(NULL) != -1);
     return 0;
 }
+
